@@ -1,0 +1,152 @@
+import os
+import logging
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pydub import AudioSegment
+from openai import OpenAI, AsyncOpenAI
+
+# --- Load environment variables from .env file ---
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+    raise ValueError("Both TELEGRAM_TOKEN and OPENAI_API_KEY must be set in .env file")
+
+# --- Setup logging ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- OpenAI clients ---
+sync_openai_client = OpenAI(api_key=OPENAI_API_KEY)          # for Whisper and TTS (sync)
+async_openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)   # for GPT (async)
+
+# --- Convert OGG (from Telegram) to MP3 (for Whisper) ---
+def convert_ogg_to_mp3(ogg_path: Path, mp3_path: Path):
+    audio = AudioSegment.from_ogg(ogg_path)
+    audio.export(mp3_path, format="mp3")
+    logger.info("Converted OGG to MP3")
+
+# --- Convert MP3 (from TTS) to OGG (for Telegram) ---
+def convert_mp3_to_ogg(mp3_path: Path, ogg_path: Path):
+    audio = AudioSegment.from_mp3(mp3_path)
+    audio.export(ogg_path, format="ogg")
+    logger.info("Converted MP3 to OGG")
+
+# --- Speech to text using Whisper ---
+def transcribe_voice(mp3_path: Path) -> str:
+    with open(mp3_path, "rb") as f:
+        transcript = sync_openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f
+        )
+    logger.info("Voice transcribed to text")
+    return transcript.text
+
+# --- Get AI response from GPT ---
+async def get_ai_response(prompt: str) -> str:
+    response = await async_openai_client.chat.completions.create(
+        model="gpt-4o-mini",   # or "gpt-3.5-turbo"
+        messages=[
+            {"role": "system", "content": "You are a helpful, concise assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=150
+    )
+    logger.info("Received AI response")
+    return response.choices[0].message.content
+
+# --- Text to speech using OpenAI TTS ---
+def text_to_speech(text: str, output_mp3_path: Path):
+    with sync_openai_client.audio.speech.with_streaming_response.create(
+        model="tts-1",
+        voice="nova",          # options: alloy, echo, fable, onyx, nova, shimmer
+        input=text,
+    ) as response:
+        response.stream_to_file(output_mp3_path)
+    logger.info("Text converted to speech")
+
+# --- Handle text messages ---
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    logger.info(f"Text from {update.effective_user.id}: {user_text}")
+
+    await update.message.chat.send_action(action="typing")
+    try:
+        ai_response = await get_ai_response(user_text)
+        await update.message.reply_text(ai_response)
+    except Exception as e:
+        logger.error(f"Text processing error: {e}")
+        await update.message.reply_text("Sorry, something went wrong.")
+
+# --- Handle voice messages ---
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    voice_file = await update.message.voice.get_file()
+
+    logger.info(f"Voice message from {user_id} – processing")
+
+    with NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
+        await voice_file.download_to_drive(tmp_ogg.name)
+        tmp_ogg_path = Path(tmp_ogg.name)
+
+    tmp_mp3_path = tmp_ogg_path.with_suffix(".mp3")
+    tmp_response_mp3 = tmp_ogg_path.with_suffix("_response.mp3")
+    final_ogg_path = tmp_ogg_path.with_suffix("_final.ogg")
+
+    try:
+        await update.message.chat.send_action(action="typing")
+
+        # 1. Convert OGG -> MP3
+        convert_ogg_to_mp3(tmp_ogg_path, tmp_mp3_path)
+
+        # 2. Transcribe voice to text
+        user_text = transcribe_voice(tmp_mp3_path)
+
+        # 3. Get AI reply
+        ai_text = await get_ai_response(user_text)
+
+        # 4. Convert AI text to speech (MP3)
+        text_to_speech(ai_text, tmp_response_mp3)
+
+        # 5. Convert MP3 -> OGG for Telegram
+        convert_mp3_to_ogg(tmp_response_mp3, final_ogg_path)
+
+        # 6. Send voice reply
+        with open(final_ogg_path, "rb") as f:
+            await update.message.reply_voice(voice=f, caption="AI voice response")
+        logger.info(f"Voice reply sent to {user_id}")
+
+    except Exception as e:
+        logger.error(f"Voice processing error: {e}")
+        await update.message.reply_text("Sorry, I couldn't process your voice message.")
+    finally:
+        # Cleanup temporary files
+        for p in [tmp_ogg_path, tmp_mp3_path, tmp_response_mp3, final_ogg_path]:
+            if p.exists():
+                p.unlink()
+
+# --- /start command handler ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello! I'm an AI voice assistant. 🤖\n"
+        "Send me a text message or a voice message, and I'll reply in the same way."
+    )
+
+# --- Main function ---
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    logger.info("Bot is starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
